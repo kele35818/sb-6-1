@@ -20,7 +20,7 @@ reading() { echo -ne "\n ${CYAN}➤ ${BOLD}$1${NC} ➔ "; read -r "$2"; }
 divider() { echo -e "${PURPLE}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫${NC}"; }
 
 print_logo() {
-    clear
+    if [ -n "$TERM" ] && command -v clear >/dev/null 2>&1; then clear; else echo ""; fi
     echo -e "${PURPLE}╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮${NC}"
     echo -e "${PURPLE}┃${NC}   ${CYAN}███████╗██╗███╗   ██╗ ██████╗       ██████╗  ██████╗ ██╗  ██╗${NC}   ${PURPLE}┃${NC}"
     echo -e "${PURPLE}┃${NC}   ${CYAN}██╔════╝██║████╗  ██║██╔════╝       ██╔══██╗██╔═══██╗╚██╗██╔╝${NC}   ${PURPLE}┃${NC}"
@@ -30,6 +30,7 @@ print_logo() {
     echo -e "${PURPLE}┃${NC}   ${CYAN}╚══════╝╚═╝╚═╝  ╚═══╝ ╚═════╝       ╚═════╝  ╚═════╝ ╚═╝  ╚═╝${NC}   ${PURPLE}┃${NC}"
     divider
     echo -e "${PURPLE}┃${NC}          ${YELLOW}${BOLD}✨ Kele's Sing-box 6-in-1 极致稳定架构 (v7.0) ✨${NC}         ${PURPLE}┃${NC}"
+    echo -e "${PURPLE}┃${NC}            ${CYAN}免域名自签 · 纯 IPv6 自适应 · 容器裸跑兼容${NC}             ${PURPLE}┃${NC}"
     echo -e "${PURPLE}╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯${NC}"
     echo ""
 }
@@ -89,6 +90,7 @@ SB_LOG="${SB_DIR}/sing-box.log"
 HAS_V4=""; HAS_V6=""; WAN4=""; WAN6=""
 NET_STACK=""; DNS_STRATEGY=""; LISTEN_ADDR=""
 ARGO_LOOP_HOST="127.0.0.1"; ARGO_BIND_ADDR="127.0.0.1"; SERVICE_BACKEND=""; IS_CONTAINER="0"
+NAT_LOCAL="0"; LOCAL_ADDR4=""
 CERT_SOURCE=""; TLS_SELF_SIGNED="0"
 SB_GUARD="/usr/local/bin/sb-guard"
 ARGO_GUARD="/usr/local/bin/sb-argo-guard"
@@ -176,6 +178,17 @@ detect_net_stack() {
     else
         ARGO_LOOP_HOST="[::1]"; ARGO_BIND_ADDR="::1"
     fi
+
+    # NAT / 容器识别：本机只有内网地址时，出网 IP ≠ 入口 IP（CDN 出口、反代转发都会踩到）
+    NAT_LOCAL="0"; LOCAL_ADDR4=""
+    if command -v ip >/dev/null 2>&1; then
+        LOCAL_ADDR4=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+        case "$LOCAL_ADDR4" in
+            10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|100.6[4-9].*|100.[7-9][0-9].*|100.1[0-2][0-9].*)
+                NAT_LOCAL="1" ;;
+        esac
+    fi
+    [ "$IS_CONTAINER" = "1" ] && NAT_LOCAL="1"
     return 0
 }
 
@@ -298,6 +311,27 @@ tls_server_name() {
     if [ -n "$VD_DOMAIN" ]; then printf '%s' "$VD_DOMAIN"; else printf '%s' "www.bing.com"; fi
 }
 
+# ---------- 内核版本探测（用于 1.12+ 域解析器迁移） ----------
+singbox_version() {
+    [ -x "$SB_BIN" ] || return 1
+    "$SB_BIN" version 2>/dev/null | sed -n 's/^sing-box version \([0-9][0-9.]*\).*/\1/p' | head -n1
+}
+
+# ver_ge 1.12  → 当前内核版本 >= 1.12 返回 0
+ver_ge() {
+    local need="$1" cur
+    cur=$(singbox_version)
+    [ -z "$cur" ] && return 1
+    awk -v c="$cur" -v n="$need" 'BEGIN{
+        nc = split(c, C, "."); nn = split(n, N, ".");
+        for (i = 1; i <= 3; i++) {
+            a = (i <= nc ? C[i] : 0) + 0; b = (i <= nn ? N[i] : 0) + 0;
+            if (a > b) exit 0;
+            if (a < b) exit 1;
+        }
+        exit 0 }'
+}
+
 # ---------- 服务后端：systemd / openrc / 裸跑(容器) ----------
 detect_service_backend() {
     local pid1=""
@@ -355,6 +389,8 @@ load_config() {
     [ -z "$LISTEN_ADDR" ] && LISTEN_ADDR=""
     [ -z "$ARGO_LOOP_HOST" ] && ARGO_LOOP_HOST="127.0.0.1"
     [ -z "$ARGO_BIND_ADDR" ] && ARGO_BIND_ADDR="127.0.0.1"
+    [ -z "$NAT_LOCAL" ] && NAT_LOCAL="0"
+    [ -z "$PREFERRED_IP" ] && PREFERRED_IP="auto"
     [ -z "$ENABLE_VD" ] && ENABLE_VD="1"
     [ -z "$ENABLE_RE" ] && ENABLE_RE="1"
     [ -z "$ENABLE_HY" ] && ENABLE_HY="1"
@@ -402,12 +438,14 @@ HY_HOPPING=$HY_HOPPING
 HY_PORTS=$HY_PORTS
 CERT_SOURCE=$CERT_SOURCE
 TLS_SELF_SIGNED=$TLS_SELF_SIGNED
-PREFERRED_IP=$PREFERRED_IP
+PREFERRED_IP=${PREFERRED_IP:-auto}
 NET_STACK=$NET_STACK
 DNS_STRATEGY=$DNS_STRATEGY
 LISTEN_ADDR=$LISTEN_ADDR
 ARGO_LOOP_HOST=$ARGO_LOOP_HOST
 ARGO_BIND_ADDR=$ARGO_BIND_ADDR
+NAT_LOCAL=$NAT_LOCAL
+LOCAL_ADDR4=$LOCAL_ADDR4
 HAS_V4=$HAS_V4
 HAS_V6=$HAS_V6
 WAN4=$WAN4
@@ -875,6 +913,13 @@ generate_config() {
     fi
     dns_servers="${dns_servers%,}"
 
+    # sing-box 1.12+ 起，出站解析域名的隐式 DNS 已废弃（1.14 直接 FATAL），
+    # 必须显式声明 route.default_domain_resolver，否则配置校验直接失败。
+    local resolver_json=""
+    if ver_ge 1.12; then
+        resolver_json="\"default_domain_resolver\": { \"server\": \"$dns_final\", \"strategy\": \"${DNS_STRATEGY:-prefer_ipv4}\" },"
+    fi
+
     cat > "${SB_CONF}.new" << EOF
 {
   "log": { "level": "warn", "timestamp": true },
@@ -891,7 +936,7 @@ generate_config() {
     { "type": "socks", "tag": "warp-out", "server": "127.0.0.1", "server_port": 40000 },
     { "type": "block", "tag": "block-out" }
   ],
-  "route": { "rules": [ $rules_json ], "auto_detect_interface": true, "final": "direct-out" }
+  "route": { $resolver_json "rules": [ $rules_json ], "auto_detect_interface": true, "final": "direct-out" }
 }
 EOF
 
@@ -1418,6 +1463,10 @@ show_nodes() {
         [ -n "$WAN4" ] && echo -e " ${BG_BLUE} 网络探针 ${NC} ${CYAN}IPv4:${NC} ${GREEN}$WAN4${NC}"
         [ -n "$WAN6" ] && echo -e " ${BG_BLUE} 网络探针 ${NC} ${CYAN}IPv6:${NC} ${GREEN}$WAN6${NC}"
         echo -e " ${BG_BLUE} 网络探针 ${NC} 入站地址: ${GREEN}$out_ip${NC} (${NODE_PREFIX})"
+        if [ "$NAT_LOCAL" = "1" ]; then
+            echo -e " ${YELLOW}⚠ 本机在内网 NAT 里（${LOCAL_ADDR4:-内网地址}），上面是【出网】IP，未必是【入口】IP。${NC}"
+            echo -e " ${YELLOW}  若节点连不通，请在这里直接填面板/服务商给你的真实入口 IP 或域名。${NC}"
+        fi
         if [ "$quiet" == "quiet" ]; then
             CUSTOM_IP="$out_ip"
         else
@@ -1565,13 +1614,15 @@ uninstall_script() {
 
 # ---------- v7：全自动部署（无交互，容器 / cloud-init 友好） ----------
 auto_deploy() {
-    local mode="self" domain="" ip_override="" use_argo=1
+    local mode="self" domain="" ip_override="" use_argo=1 ports_override="" use_udp=1
     while [ $# -gt 0 ]; do
         case "$1" in
             --mode=*) mode="${1#*=}" ;;
             --domain=*) domain="${1#*=}" ;;
             --ip=*) ip_override="${1#*=}" ;;
             --no-argo) use_argo=0 ;;
+            --ports=*) ports_override="${1#*=}" ;;
+            --no-udp|--tcp-only) use_udp=0 ;;
             self|acme|none) mode="$1" ;;
             -h|--help)
                 cat <<'USAGE'
@@ -1580,6 +1631,8 @@ auto_deploy() {
   --domain=xxx.com        acme 模式必填
   --ip=1.2.3.4            强制指定节点地址（纯 IPv6 直接填地址）
   --no-argo               不启用 Argo 隧道
+  --ports=a,b,c,d,e       固定端口：VLESS,Reality,Hy2,TUIC,SOCKS5（容器端口映射必填）
+  --no-udp               不开 Hy2 / TUIC（面板只映射 TCP 时用，避免出现必然超时的节点）
 
 示例:
   bash sb.sh auto
@@ -1625,23 +1678,45 @@ USAGE
 
     ENABLE_VD=1; ENABLE_RE=1; ENABLE_S5=1
     ENABLE_ARGO=$use_argo
-    if [ "$CERT_SOURCE" == "none" ]; then ENABLE_HY=0; ENABLE_TC=0; else ENABLE_HY=1; ENABLE_TC=1; fi
+    if [ "$CERT_SOURCE" == "none" ] || [ "$use_udp" == "0" ]; then
+        ENABLE_HY=0; ENABLE_TC=0
+        [ "$use_udp" == "0" ] && msg_warn "已按 --no-udp 关闭 Hy2 / TUIC（UDP 节点需要面板转发 UDP）。"
+    else
+        ENABLE_HY=1; ENABLE_TC=1
+    fi
 
     msg_info "正在生成 Reality 专属密钥对..."
     generate_reality_keys || { msg_error "Reality 密钥生成失败，中止。"; return 1; }
     REALITY_SHORT_ID=""; REALITY_SNI="addons.mozilla.org"
 
-    msg_info "正在自动分配系统可用端口..."
-    PORT_VD=$(get_random_port); PORT_RE=$(get_random_port); PORT_S5=$(get_random_port)
-    PORT_HY=""; PORT_TC=""
-    [ "$ENABLE_HY" == "1" ] && PORT_HY=$(get_random_port)
-    [ "$ENABLE_TC" == "1" ] && PORT_TC=$(get_random_port)
+    msg_info "正在分配端口..."
+    PORT_VD=""; PORT_RE=""; PORT_HY=""; PORT_TC=""; PORT_S5=""
+    if [ -n "$ports_override" ]; then
+        local _ps
+        IFS=',' read -ra _ps <<< "$ports_override"
+        PORT_VD="${_ps[0]:-}"; PORT_RE="${_ps[1]:-}"; PORT_HY="${_ps[2]:-}"
+        PORT_TC="${_ps[3]:-}"; PORT_S5="${_ps[4]:-}"
+        echo -e "  ${CYAN}➤ 使用指定端口: VLESS=$PORT_VD Reality=$PORT_RE Hy2=$PORT_HY TUIC=$PORT_TC SOCKS5=$PORT_S5${NC}"
+    fi
+    [ -z "$PORT_VD" ] && PORT_VD=$(get_random_port)
+    [ -z "$PORT_RE" ] && PORT_RE=$(get_random_port)
+    [ -z "$PORT_S5" ] && PORT_S5=$(get_random_port)
+    [ "$ENABLE_HY" == "1" ] && [ -z "$PORT_HY" ] && PORT_HY=$(get_random_port)
+    [ "$ENABLE_TC" == "1" ] && [ -z "$PORT_TC" ] && PORT_TC=$(get_random_port)
 
     ARGO_MODE="temp"; ARGO_TOKEN=""; ARGO_DOMAIN=""
     WARP_MODE="1"; WARP_DOMAINS=""
     HY_HOPPING="0"; HY_PORTS=""
     if [ "$CERT_SOURCE" == "none" ]; then VD_MODE="1"; else VD_MODE="2"; fi
     if [ -n "$ip_override" ]; then CUSTOM_IP="$ip_override"; else CUSTOM_IP=$(get_outbound_ip); fi
+
+    if [ "$NAT_LOCAL" = "1" ] && [ -z "$ip_override" ]; then
+        msg_warn "本机在内网 NAT 中（${LOCAL_ADDR4:-N/A}）：节点地址取的是出网 IP $CUSTOM_IP，"
+        msg_warn "若它不是真实入口 IP，请改用 --ip=真实IP，或部署后执行 sb nodes 手动指定。"
+    fi
+    if [ "$ENABLE_HY" == "1" ] && [ "$NAT_LOCAL" = "1" ]; then
+        msg_warn "NAT / 容器环境：请确认面板已把 $PORT_HY / $PORT_TC 的 UDP 也转发进来，否则 Hy2 / TUIC 必然超时（可用 --no-udp 关掉）。"
+    fi
 
     msg_info "正在写入底层架构并启动守护进程..."
     if ! generate_config; then msg_error "配置生成失败，部署中止。"; return 1; fi
@@ -1680,6 +1755,11 @@ main_menu() {
 case "${1:-}" in
     auto|--auto) shift; auto_deploy "$@" ;;
     nodes)       shift; show_nodes "${1:-}" ;;
+    apply)
+        load_config
+        ensure_net_stack
+        if generate_config; then setup_services; msg_success "配置已重载并重启服务。"; else msg_error "配置未通过校验，已保留旧配置。"; exit 1; fi
+        ;;
     info)
         load_config
         ensure_net_stack
@@ -1687,8 +1767,10 @@ case "${1:-}" in
         echo "网络栈   : $NET_STACK ($(net_stack_label))"
         echo "DNS 策略 : $DNS_STRATEGY"
         echo "监听地址 : $LISTEN_ADDR"
-        echo "IPv4     : ${WAN4:-无}"
-        echo "IPv6     : ${WAN6:-无}"
+        echo "出网 IPv4: ${WAN4:-无}"
+        echo "出网 IPv6: ${WAN6:-无}"
+        echo "内网地址 : ${LOCAL_ADDR4:-无}$([ "$NAT_LOCAL" = "1" ] && echo "  (NAT/容器：出网 IP 未必是入口 IP)")"
+        echo "节点地址 : ${CUSTOM_IP:-未指定（sb nodes 可改）}"
         echo "证书策略 : $CERT_SOURCE (selfsigned=$TLS_SELF_SIGNED)"
         echo "域名     : ${VD_DOMAIN:-无}"
         echo "服务后端 : ${SERVICE_BACKEND:-$(detect_service_backend; echo "$SERVICE_BACKEND")}"
